@@ -24,8 +24,8 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 LEADS_DIR = DATA_DIR / "leads"
 LEADS_DIR.mkdir(exist_ok=True)
-
 TEAM_MEMBERS = ["Brad", "James"]
+QUICK_ADD_DEFAULT = 15
 
 
 def today_uk_str() -> str:
@@ -126,12 +126,11 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
     if df.empty:
         return pd.DataFrame(columns=["company_number", "company_name", "sector", "time_added_to_table", "pull_order"])
 
-    df = (
+    return (
         df.sort_values("pull_order", ascending=False, kind="stable")
         .drop_duplicates(subset=["company_number"], keep="first")
         .reset_index(drop=True)
     )
-    return df
 
 
 def get_store_paths(run_date: str) -> Tuple[Path, Path]:
@@ -141,11 +140,12 @@ def get_store_paths(run_date: str) -> Tuple[Path, Path]:
 
 
 def lead_file_path(person: str, run_date: str) -> Path:
-    slug = person.strip().lower()
-    return LEADS_DIR / f"{slug}_leads_{run_date}.csv"
+    return LEADS_DIR / f"{person.strip().lower()}_leads_{run_date}.csv"
 
 
-def load_csv_or_empty(path: Path) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_csv_cached(path_str: str) -> pd.DataFrame:
+    path = Path(path_str)
     if path.exists():
         df = pd.read_csv(path, dtype=str).fillna("")
         if "time_added_to_table" in df.columns:
@@ -168,6 +168,8 @@ def identify_new_rows(current_df: pd.DataFrame, seen_df: pd.DataFrame) -> pd.Dat
 def save_state(current_df: pd.DataFrame, snapshot_path: Path, seen_path: Path) -> None:
     current_df.to_csv(snapshot_path, index=False)
     current_df.to_csv(seen_path, index=False)
+    load_csv_cached.clear()
+    convert_results_csv.clear()
 
 
 def add_company_to_leads(person: str, run_date: str, row: pd.Series) -> bool:
@@ -193,20 +195,22 @@ def add_company_to_leads(person: str, run_date: str, row: pd.Series) -> bool:
         "added_by": person,
         "added_at": now_uk_str(),
     }])
-
     leads_df = pd.concat([leads_df, new_row], ignore_index=True)
     leads_df.to_csv(path, index=False)
+    load_csv_cached.clear()
+    convert_leads_csv.clear()
     return True
 
 
 def load_leads(person: str, run_date: str) -> pd.DataFrame:
     path = lead_file_path(person, run_date)
-    if path.exists():
-        return pd.read_csv(path, dtype=str).fillna("")
-    return pd.DataFrame(columns=["company_number", "company_name", "sector", "added_by", "added_at"])
+    df = load_csv_cached(str(path))
+    if df.empty:
+        return pd.DataFrame(columns=["company_number", "company_name", "sector", "added_by", "added_at"])
+    return df
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def convert_results_csv(df: pd.DataFrame) -> bytes:
     return (
         df.sort_values("time_added_to_table", ascending=False, kind="stable")[["company_name", "sector", "time_added_to_table"]]
@@ -220,7 +224,7 @@ def convert_results_csv(df: pd.DataFrame) -> bytes:
     )
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def convert_leads_csv(df: pd.DataFrame) -> bytes:
     return (
         df.rename(columns={
@@ -235,45 +239,33 @@ def convert_leads_csv(df: pd.DataFrame) -> bytes:
     )
 
 
-def render_plain_table(df: pd.DataFrame, title: str) -> None:
-    st.subheader(title)
-    if df.empty:
-        st.info("No companies to show yet.")
-        return
-    display_df = (
-        df.sort_values("time_added_to_table", ascending=False, kind="stable")[["company_name", "sector", "time_added_to_table"]]
-        .rename(columns={
-            "company_name": "Company Name",
-            "sector": "Sector",
-            "time_added_to_table": "Time Added To Table",
-        })
-    )
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-
-def render_add_list(df: pd.DataFrame, person: str, run_date: str, widget_prefix: str) -> None:
+def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_leads: pd.DataFrame) -> None:
     st.subheader(f"Quick add to {person}'s leads")
     if df.empty:
         st.info("No companies available to add.")
         return
 
+    existing_numbers = set(existing_leads["company_number"].astype(str)) if not existing_leads.empty and "company_number" in existing_leads.columns else set()
+
     for idx, (_, row) in enumerate(df.iterrows()):
-        c1, c2, c3, c4 = st.columns([4, 1.2, 2, 1])
+        company_number = str(row.get("company_number", "")).strip()
+        already_added = company_number in existing_numbers
+        c1, c2, c3, c4 = st.columns([5, 1.2, 2, 0.9])
         c1.write(f"**{row['company_name']}**")
         c2.write(str(row["sector"]))
         c3.write(str(row["time_added_to_table"]))
-        button_key = f"{widget_prefix}_add_{person}_{row['company_number']}_{idx}"
-        if c4.button("Add", key=button_key):
-            added = add_company_to_leads(person, run_date, row)
-            if added:
-                st.success(f"Added {row['company_name']} to {person}'s leads.")
-            else:
-                st.info(f"{row['company_name']} is already in {person}'s leads for today.")
+        if already_added:
+            c4.caption("Added")
+        else:
+            if c4.button("Add", key=f"add_{person}_{company_number}_{idx}"):
+                added = add_company_to_leads(person, run_date, row)
+                if added:
+                    st.rerun()
 
 
 def main() -> None:
     st.title("Companies Incorporated Today")
-    st.caption("Fast lead prospect engine with lightweight Add buttons and per-user daily CSV lead files for Brad and James.")
+    st.caption("Ultra-fast version: minimal UI, top leads only, CSV-backed Add actions for Brad and James.")
 
     api_keys = get_api_keys()
     if not api_keys:
@@ -284,15 +276,12 @@ def main() -> None:
     snapshot_path, seen_path = get_store_paths(run_date)
 
     st.sidebar.header("Controls")
-    st.sidebar.write(f"Run date: {run_date}")
-    st.sidebar.write(f"API keys loaded: {len(api_keys)}")
     selected_user = st.sidebar.selectbox("Working as", TEAM_MEMBERS, index=0)
-    quick_add_count = st.sidebar.slider("Quick add rows shown", min_value=10, max_value=50, value=25, step=5)
     refresh = st.sidebar.button("Refresh now", type="primary")
 
     if refresh or not snapshot_path.exists():
         fetched_df = fetch_companies_incorporated_today(api_keys, run_date)
-        existing_df = load_csv_or_empty(snapshot_path)
+        existing_df = load_csv_cached(str(snapshot_path))
         if existing_df.empty:
             current_df = fetched_df.copy()
         else:
@@ -300,92 +289,74 @@ def main() -> None:
             new_rows = fetched_df[~fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
             current_df = pd.concat([new_rows, existing_df], ignore_index=True)
             current_df = current_df.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
-        seen_df = load_csv_or_empty(seen_path)
+        seen_df = load_csv_cached(str(seen_path))
         new_df = identify_new_rows(current_df, seen_df)
         save_state(current_df, snapshot_path, seen_path)
         st.session_state["latest_df"] = current_df
         st.session_state["new_df"] = new_df
         st.session_state["last_refresh"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     else:
-        current_df = load_csv_or_empty(snapshot_path)
+        current_df = load_csv_cached(str(snapshot_path))
+        new_df = load_csv_cached(str(seen_path))
         st.session_state.setdefault("latest_df", current_df)
-        st.session_state.setdefault("new_df", pd.DataFrame(columns=current_df.columns if not current_df.empty else ["company_number", "company_name", "sector", "time_added_to_table", "pull_order"]))
+        st.session_state.setdefault("new_df", new_df)
         st.session_state.setdefault("last_refresh", "Not refreshed in this session")
 
     current_df = st.session_state.get("latest_df", pd.DataFrame())
-    new_df = st.session_state.get("new_df", pd.DataFrame())
     leads_df = load_leads(selected_user, run_date)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Total pulled today", int(len(current_df)))
-    c2.metric("New on latest refresh", int(len(new_df)))
-    c3.metric(f"{selected_user}'s leads today", int(len(leads_df)))
-    c4.metric("Run date", run_date)
+    c2.metric(f"{selected_user}'s leads today", int(len(leads_df)))
+    c3.metric("Quick add rows", QUICK_ADD_DEFAULT)
 
-    st.write(f"Working as: {selected_user}")
-    st.write(f"Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
+    st.caption(f"Working as {selected_user} | Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
 
-    newest_df = current_df.sort_values("time_added_to_table", ascending=False, kind="stable").head(quick_add_count).reset_index(drop=True) if not current_df.empty else current_df
-    render_add_list(newest_df, selected_user, run_date, widget_prefix="quick")
+    newest_df = current_df.sort_values("time_added_to_table", ascending=False, kind="stable").head(QUICK_ADD_DEFAULT).reset_index(drop=True) if not current_df.empty else current_df
+    render_quick_add(newest_df, selected_user, run_date, leads_df)
 
-    with st.expander("New companies found on the latest refresh", expanded=False):
-        render_plain_table(new_df, "New companies")
+    with st.expander(f"{selected_user}'s leads for today", expanded=False):
+        if leads_df.empty:
+            st.info(f"No leads saved yet for {selected_user}.")
+        else:
+            leads_display = leads_df.rename(columns={
+                "company_number": "Company Number",
+                "company_name": "Company Name",
+                "sector": "Sector",
+                "added_by": "Added By",
+                "added_at": "Added At",
+            })
+            st.dataframe(leads_display, use_container_width=True, hide_index=True)
+            st.download_button(
+                label=f"Download {selected_user}'s leads CSV",
+                data=convert_leads_csv(leads_df),
+                file_name=f"{selected_user.lower()}_leads_{run_date}.csv",
+                mime="text/csv",
+                key=f"download_{selected_user.lower()}_leads",
+            )
 
-    with st.expander("All companies pulled so far today", expanded=False):
-        render_plain_table(current_df, "All companies")
+    with st.expander("Today's results CSV", expanded=False):
+        if not current_df.empty:
+            st.download_button(
+                label="Download today’s results as CSV",
+                data=convert_results_csv(current_df),
+                file_name=f"companies_incorporated_{run_date}.csv",
+                mime="text/csv",
+                key="download_results_csv",
+            )
+        else:
+            st.info("No results available yet.")
 
-    st.subheader(f"{selected_user}'s leads for today")
-    if leads_df.empty:
-        st.info(f"No leads saved yet for {selected_user}.")
-    else:
-        leads_display = leads_df.rename(columns={
-            "company_number": "Company Number",
-            "company_name": "Company Name",
-            "sector": "Sector",
-            "added_by": "Added By",
-            "added_at": "Added At",
-        })
-        st.dataframe(leads_display, use_container_width=True, hide_index=True)
-        st.download_button(
-            label=f"Download {selected_user}'s leads CSV",
-            data=convert_leads_csv(leads_df),
-            file_name=f"{selected_user.lower()}_leads_{run_date}.csv",
-            mime="text/csv",
-            key=f"download_{selected_user.lower()}_leads",
-        )
-
-    if not current_df.empty:
-        st.download_button(
-            label="Download today’s results as CSV",
-            data=convert_results_csv(current_df),
-            file_name=f"companies_incorporated_{run_date}.csv",
-            mime="text/csv",
-            key="download_results_csv",
-        )
-
-    with st.expander("Suggested .streamlit/secrets.toml"):
-        secrets_example = """COMPANIES_HOUSE_API_KEYS = [
-  \"your-first-key\",
-  \"your-second-key\",
-  \"your-third-key\"
-]
-
-# Optional legacy format
-# CH_API_KEY_1 = \"your-first-key\"
-# CH_API_KEY_2 = \"your-second-key\"
-# CH_API_KEY_3 = \"your-third-key\"
-"""
-        st.code(secrets_example, language="toml")
-
-    with st.expander("Notes"):
-        st.markdown(
-            """
-- This version is optimized for speed by avoiding `st.data_editor` and using simple Add buttons instead.
-- Clicking Add writes the company to that person's daily CSV lead file in `data/leads/`.
-- Brad and James each have separate lead files for the day.
-- The main companies table is not edited during lead capture.
-            """
-        )
+    with st.expander("Full table", expanded=False):
+        if current_df.empty:
+            st.info("No companies to show yet.")
+        else:
+            preview_df = current_df[["company_name", "sector", "time_added_to_table"]].rename(columns={
+                "company_name": "Company Name",
+                "sector": "Sector",
+                "time_added_to_table": "Time Added To Table",
+            })
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
