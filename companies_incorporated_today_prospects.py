@@ -26,6 +26,8 @@ LEADS_DIR = DATA_DIR / "leads"
 LEADS_DIR.mkdir(exist_ok=True)
 TEAM_MEMBERS = ["Brad", "James"]
 QUICK_ADD_DEFAULT = 15
+RESULT_COLUMNS = ["company_number", "company_name", "sector", "time_added_to_table", "pull_order"]
+LEAD_COLUMNS = ["company_number", "company_name", "sector", "added_by", "added_at"]
 
 
 def today_uk_str() -> str:
@@ -71,10 +73,16 @@ def classify_sector(sic_codes: List[str]) -> Optional[str]:
     return None
 
 
+@st.cache_resource(show_spinner=False)
+def get_session() -> requests.Session:
+    return requests.Session()
+
+
 def fetch_with_rotation(url: str, params: Dict[str, str], api_keys: List[str], timeout: int = 30) -> requests.Response:
+    session = get_session()
     last_response = None
     for api_key in api_keys:
-        response = requests.get(url, headers=auth_header(api_key), params=params, timeout=timeout)
+        response = session.get(url, headers=auth_header(api_key), params=params, timeout=timeout)
         if response.status_code in (401, 429):
             last_response = response
             continue
@@ -110,8 +118,8 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
             if not sector:
                 continue
             rows.append({
-                "company_number": item.get("company_number", ""),
-                "company_name": item.get("company_name", ""),
+                "company_number": str(item.get("company_number", "")),
+                "company_name": str(item.get("company_name", "")),
                 "sector": sector,
                 "time_added_to_table": now_uk_str(),
                 "pull_order": pull_counter,
@@ -122,10 +130,10 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
             break
         start_index += page_size
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return pd.DataFrame(columns=["company_number", "company_name", "sector", "time_added_to_table", "pull_order"])
+    if not rows:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
 
+    df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
     return (
         df.sort_values("pull_order", ascending=False, kind="stable")
         .drop_duplicates(subset=["company_number"], keep="first")
@@ -144,16 +152,30 @@ def lead_file_path(person: str, run_date: str) -> Path:
 
 
 @st.cache_data(show_spinner=False)
-def load_csv_cached(path_str: str) -> pd.DataFrame:
+def load_results_csv(path_str: str, mtime: float) -> pd.DataFrame:
     path = Path(path_str)
-    if path.exists():
-        df = pd.read_csv(path, dtype=str).fillna("")
-        if "time_added_to_table" in df.columns:
-            df["time_added_to_table"] = pd.to_datetime(df["time_added_to_table"], errors="coerce")
-        if "pull_order" in df.columns:
-            df["pull_order"] = pd.to_numeric(df["pull_order"], errors="coerce")
-        return df
-    return pd.DataFrame()
+    if not path.exists():
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+    return pd.read_csv(path, dtype={c: "string" for c in RESULT_COLUMNS}).fillna("")
+
+
+@st.cache_data(show_spinner=False)
+def load_leads_csv(path_str: str, mtime: float) -> pd.DataFrame:
+    path = Path(path_str)
+    if not path.exists():
+        return pd.DataFrame(columns=LEAD_COLUMNS)
+    return pd.read_csv(path, dtype={c: "string" for c in LEAD_COLUMNS}).fillna("")
+
+
+def load_results(path: Path) -> pd.DataFrame:
+    mtime = path.stat().st_mtime if path.exists() else 0.0
+    return load_results_csv(str(path), mtime)
+
+
+def load_leads(person: str, run_date: str) -> pd.DataFrame:
+    path = lead_file_path(person, run_date)
+    mtime = path.stat().st_mtime if path.exists() else 0.0
+    return load_leads_csv(str(path), mtime)
 
 
 def identify_new_rows(current_df: pd.DataFrame, seen_df: pd.DataFrame) -> pd.DataFrame:
@@ -168,24 +190,15 @@ def identify_new_rows(current_df: pd.DataFrame, seen_df: pd.DataFrame) -> pd.Dat
 def save_state(current_df: pd.DataFrame, snapshot_path: Path, seen_path: Path) -> None:
     current_df.to_csv(snapshot_path, index=False)
     current_df.to_csv(seen_path, index=False)
-    load_csv_cached.clear()
-    convert_results_csv.clear()
 
 
-def add_company_to_leads(person: str, run_date: str, row: pd.Series) -> bool:
+def add_company_to_leads(person: str, run_date: str, row: pd.Series, existing_leads: pd.DataFrame) -> bool:
     path = lead_file_path(person, run_date)
-    columns = ["company_number", "company_name", "sector", "added_by", "added_at"]
-
-    if path.exists():
-        leads_df = pd.read_csv(path, dtype=str).fillna("")
-    else:
-        leads_df = pd.DataFrame(columns=columns)
-
     company_number = str(row.get("company_number", "")).strip()
     if not company_number:
         return False
 
-    if not leads_df.empty and company_number in set(leads_df["company_number"].astype(str)):
+    if not existing_leads.empty and company_number in set(existing_leads["company_number"].astype(str)):
         return False
 
     new_row = pd.DataFrame([{
@@ -194,49 +207,45 @@ def add_company_to_leads(person: str, run_date: str, row: pd.Series) -> bool:
         "sector": str(row.get("sector", "")).strip(),
         "added_by": person,
         "added_at": now_uk_str(),
-    }])
-    leads_df = pd.concat([leads_df, new_row], ignore_index=True)
-    leads_df.to_csv(path, index=False)
-    load_csv_cached.clear()
-    convert_leads_csv.clear()
+    }], columns=LEAD_COLUMNS)
+
+    if path.exists():
+        new_row.to_csv(path, mode="a", index=False, header=False)
+    else:
+        new_row.to_csv(path, index=False)
     return True
 
 
-def load_leads(person: str, run_date: str) -> pd.DataFrame:
-    path = lead_file_path(person, run_date)
-    df = load_csv_cached(str(path))
+@st.cache_data(show_spinner=False)
+def convert_results_csv_bytes(df: pd.DataFrame) -> bytes:
     if df.empty:
-        return pd.DataFrame(columns=["company_number", "company_name", "sector", "added_by", "added_at"])
-    return df
+        return b""
+    export_df = df[["company_name", "sector", "time_added_to_table"]].rename(columns={
+        "company_name": "Company Name",
+        "sector": "Sector",
+        "time_added_to_table": "Time Added To Table",
+    })
+    return export_df.to_csv(index=False).encode("utf-8")
 
 
 @st.cache_data(show_spinner=False)
-def convert_results_csv(df: pd.DataFrame) -> bytes:
-    return (
-        df.sort_values("time_added_to_table", ascending=False, kind="stable")[["company_name", "sector", "time_added_to_table"]]
-        .rename(columns={
-            "company_name": "Company Name",
-            "sector": "Sector",
-            "time_added_to_table": "Time Added To Table",
-        })
-        .to_csv(index=False)
-        .encode("utf-8")
-    )
+def convert_leads_csv_bytes(df: pd.DataFrame) -> bytes:
+    if df.empty:
+        return b""
+    export_df = df.rename(columns={
+        "company_number": "Company Number",
+        "company_name": "Company Name",
+        "sector": "Sector",
+        "added_by": "Added By",
+        "added_at": "Added At",
+    })
+    return export_df.to_csv(index=False).encode("utf-8")
 
 
-@st.cache_data(show_spinner=False)
-def convert_leads_csv(df: pd.DataFrame) -> bytes:
-    return (
-        df.rename(columns={
-            "company_number": "Company Number",
-            "company_name": "Company Name",
-            "sector": "Sector",
-            "added_by": "Added By",
-            "added_at": "Added At",
-        })
-        .to_csv(index=False)
-        .encode("utf-8")
-    )
+def get_sorted_current_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return df.sort_values("pull_order", ascending=False, kind="stable").reset_index(drop=True)
 
 
 def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_leads: pd.DataFrame) -> None:
@@ -245,7 +254,7 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
         st.info("No companies available to add.")
         return
 
-    existing_numbers = set(existing_leads["company_number"].astype(str)) if not existing_leads.empty and "company_number" in existing_leads.columns else set()
+    existing_numbers = set(existing_leads["company_number"].astype(str)) if not existing_leads.empty else set()
 
     for idx, (_, row) in enumerate(df.iterrows()):
         company_number = str(row.get("company_number", "")).strip()
@@ -258,14 +267,14 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
             c4.caption("Added")
         else:
             if c4.button("Add", key=f"add_{person}_{company_number}_{idx}"):
-                added = add_company_to_leads(person, run_date, row)
+                added = add_company_to_leads(person, run_date, row, existing_leads)
                 if added:
                     st.rerun()
 
 
 def main() -> None:
     st.title("Companies Incorporated Today")
-    st.caption("Ultra-fast version: minimal UI, top leads only, CSV-backed Add actions for Brad and James.")
+    st.caption("Ultra-fast version v2: session reuse, narrower cache invalidation, minimal rendering, top-15 quick add list.")
 
     api_keys = get_api_keys()
     if not api_keys:
@@ -281,7 +290,7 @@ def main() -> None:
 
     if refresh or not snapshot_path.exists():
         fetched_df = fetch_companies_incorporated_today(api_keys, run_date)
-        existing_df = load_csv_cached(str(snapshot_path))
+        existing_df = load_results(snapshot_path)
         if existing_df.empty:
             current_df = fetched_df.copy()
         else:
@@ -289,20 +298,22 @@ def main() -> None:
             new_rows = fetched_df[~fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
             current_df = pd.concat([new_rows, existing_df], ignore_index=True)
             current_df = current_df.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
-        seen_df = load_csv_cached(str(seen_path))
+        seen_df = load_results(seen_path)
         new_df = identify_new_rows(current_df, seen_df)
         save_state(current_df, snapshot_path, seen_path)
         st.session_state["latest_df"] = current_df
+        st.session_state["sorted_df"] = get_sorted_current_df(current_df)
         st.session_state["new_df"] = new_df
         st.session_state["last_refresh"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     else:
-        current_df = load_csv_cached(str(snapshot_path))
-        new_df = load_csv_cached(str(seen_path))
+        current_df = load_results(snapshot_path)
         st.session_state.setdefault("latest_df", current_df)
-        st.session_state.setdefault("new_df", new_df)
+        st.session_state.setdefault("sorted_df", get_sorted_current_df(current_df))
+        st.session_state.setdefault("new_df", pd.DataFrame(columns=RESULT_COLUMNS))
         st.session_state.setdefault("last_refresh", "Not refreshed in this session")
 
-    current_df = st.session_state.get("latest_df", pd.DataFrame())
+    current_df = st.session_state.get("latest_df", pd.DataFrame(columns=RESULT_COLUMNS))
+    sorted_df = st.session_state.get("sorted_df", pd.DataFrame(columns=RESULT_COLUMNS))
     leads_df = load_leads(selected_user, run_date)
 
     c1, c2, c3 = st.columns(3)
@@ -312,7 +323,7 @@ def main() -> None:
 
     st.caption(f"Working as {selected_user} | Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
 
-    newest_df = current_df.sort_values("time_added_to_table", ascending=False, kind="stable").head(QUICK_ADD_DEFAULT).reset_index(drop=True) if not current_df.empty else current_df
+    newest_df = sorted_df.head(QUICK_ADD_DEFAULT).reset_index(drop=True) if not sorted_df.empty else sorted_df
     render_quick_add(newest_df, selected_user, run_date, leads_df)
 
     with st.expander(f"{selected_user}'s leads for today", expanded=False):
@@ -329,7 +340,7 @@ def main() -> None:
             st.dataframe(leads_display, use_container_width=True, hide_index=True)
             st.download_button(
                 label=f"Download {selected_user}'s leads CSV",
-                data=convert_leads_csv(leads_df),
+                data=convert_leads_csv_bytes(leads_df),
                 file_name=f"{selected_user.lower()}_leads_{run_date}.csv",
                 mime="text/csv",
                 key=f"download_{selected_user.lower()}_leads",
@@ -339,7 +350,7 @@ def main() -> None:
         if not current_df.empty:
             st.download_button(
                 label="Download today’s results as CSV",
-                data=convert_results_csv(current_df),
+                data=convert_results_csv_bytes(current_df),
                 file_name=f"companies_incorporated_{run_date}.csv",
                 mime="text/csv",
                 key="download_results_csv",
@@ -351,7 +362,7 @@ def main() -> None:
         if current_df.empty:
             st.info("No companies to show yet.")
         else:
-            preview_df = current_df[["company_name", "sector", "time_added_to_table"]].rename(columns={
+            preview_df = sorted_df[["company_name", "sector", "time_added_to_table"]].rename(columns={
                 "company_name": "Company Name",
                 "sector": "Sector",
                 "time_added_to_table": "Time Added To Table",
