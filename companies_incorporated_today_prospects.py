@@ -121,8 +121,6 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
                 "company_number": str(item.get("company_number", "")),
                 "company_name": str(item.get("company_name", "")),
                 "sector": sector,
-                # ✅ FIX: timestamp is recorded at fetch time; will be overridden
-                # by the preserved value for already-known companies during merge.
                 "time_added_to_table": now_uk_str(),
                 "pull_order": pull_counter,
             })
@@ -247,7 +245,37 @@ def convert_leads_csv_bytes(df: pd.DataFrame) -> bytes:
 def get_sorted_current_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    return df.sort_values("pull_order", ascending=False, kind="stable").reset_index(drop=True)
+    # Sort by time_added_to_table descending (newest first),
+    # using pull_order as a stable tiebreaker for rows pulled in the same second.
+    return (
+        df.sort_values(
+            ["time_added_to_table", "pull_order"],
+            ascending=[False, False],
+            kind="stable",
+        )
+        .reset_index(drop=True)
+    )
+
+
+def merge_preserving_timestamps(fetched_df: pd.DataFrame, existing_df: pd.DataFrame) -> pd.DataFrame:
+    if existing_df.empty:
+        return fetched_df.copy()
+
+    existing_lookup = existing_df.set_index("company_number")[["time_added_to_table", "pull_order"]]
+    existing_numbers = set(existing_df["company_number"].astype(str))
+
+    new_rows = fetched_df[~fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
+
+    known_rows = fetched_df[fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
+    known_rows["time_added_to_table"] = known_rows["company_number"].map(
+        existing_lookup["time_added_to_table"]
+    )
+    known_rows["pull_order"] = known_rows["company_number"].map(
+        existing_lookup["pull_order"].astype(int)
+    )
+
+    merged = pd.concat([new_rows, known_rows], ignore_index=True)
+    return merged.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
 
 
 def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_leads: pd.DataFrame) -> None:
@@ -274,34 +302,6 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
                     st.rerun()
 
 
-def merge_preserving_timestamps(fetched_df: pd.DataFrame, existing_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ✅ FIX: Merge fetched results with the existing snapshot, keeping the
-    original time_added_to_table for companies that already exist in the
-    snapshot. Only genuinely new companies get the current fetch timestamp.
-    """
-    if existing_df.empty:
-        return fetched_df.copy()
-
-    existing_lookup = existing_df.set_index("company_number")[["time_added_to_table", "pull_order"]]
-    existing_numbers = set(existing_df["company_number"].astype(str))
-
-    # Split fetched rows into new vs already-known
-    new_rows = fetched_df[~fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
-
-    # For already-known rows, restore their original timestamps and pull_order
-    known_rows = fetched_df[fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
-    known_rows["time_added_to_table"] = known_rows["company_number"].map(
-        existing_lookup["time_added_to_table"]
-    )
-    known_rows["pull_order"] = known_rows["company_number"].map(
-        existing_lookup["pull_order"].astype(int)
-    )
-
-    merged = pd.concat([new_rows, known_rows], ignore_index=True)
-    return merged.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
-
-
 def main() -> None:
     st.title("Companies Incorporated Today")
     st.caption("Ultra-fast version v2: session reuse, narrower cache invalidation, minimal rendering, top-15 quick add list.")
@@ -321,10 +321,7 @@ def main() -> None:
     if refresh or not snapshot_path.exists():
         fetched_df = fetch_companies_incorporated_today(api_keys, run_date)
         existing_df = load_results(snapshot_path)
-
-        # ✅ FIX: Use merge function that preserves original timestamps
         current_df = merge_preserving_timestamps(fetched_df, existing_df)
-
         seen_df = load_results(seen_path)
         new_df = identify_new_rows(current_df, seen_df)
         save_state(current_df, snapshot_path, seen_path)
