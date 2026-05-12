@@ -9,17 +9,14 @@ import streamlit as st
 
 st.set_page_config(page_title="Companies Incorporated Today", layout="wide")
 
-TECH_SIC_CODES = {
-    "62012", "62020", "58290", "58210", "61100", "61200", "61300", "61900",
-    "62011", "62030", "62090", "63110", "63120", "71200", "72110", "72190",
-    "72200", "71129",
-}
+SIC_62012_CODES = {"62012"}
+SIC_72110_CODES = {"72110"}
 
 HOLDINGS_SIC_CODES = {
     "64201", "64202", "64203", "64204", "64205", "64209", "66300",
 }
 
-TARGET_SIC_CODES = sorted(TECH_SIC_CODES | HOLDINGS_SIC_CODES)
+TARGET_SIC_CODES = sorted(HOLDINGS_SIC_CODES | SIC_62012_CODES | SIC_72110_CODES)
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 LEADS_DIR = DATA_DIR / "leads"
@@ -68,8 +65,10 @@ def classify_sector(sic_codes: List[str]) -> Optional[str]:
     codes = {str(code) for code in (sic_codes or [])}
     if codes & HOLDINGS_SIC_CODES:
         return "Holdings"
-    if codes & TECH_SIC_CODES:
-        return "Tech"
+    if codes & SIC_62012_CODES:
+        return "62012"
+    if codes & SIC_72110_CODES:
+        return "72110"
     return None
 
 
@@ -245,8 +244,6 @@ def convert_leads_csv_bytes(df: pd.DataFrame) -> bytes:
 def get_sorted_current_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    # Sort by time_added_to_table descending (newest first),
-    # using pull_order as a stable tiebreaker for rows pulled in the same second.
     return (
         df.sort_values(
             ["time_added_to_table", "pull_order"],
@@ -304,7 +301,7 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
 
 def main() -> None:
     st.title("Companies Incorporated Today")
-    st.caption("Ultra-fast version v2: session reuse, narrower cache invalidation, minimal rendering, top-15 quick add list.")
+    st.caption("Filtered to Holdings, 62012, and 72110 only.")
 
     api_keys = get_api_keys()
     if not api_keys:
