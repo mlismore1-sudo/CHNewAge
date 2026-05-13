@@ -9,14 +9,17 @@ import streamlit as st
 
 st.set_page_config(page_title="Companies Incorporated Today", layout="wide")
 
-SIC_62012_CODES = {"62012"}
-SIC_72110_CODES = {"72110"}
-
-HOLDINGS_SIC_CODES = {
-    "64201", "64202", "64203", "64204", "64205", "64209", "66300",
+SECTOR_SIC_CODES = {
+    "Tech": {"62012"},
+    "Biotech": {"72110"},
+    "Restaurants": {"56101"},
+    "Travel": {"79110"},
 }
 
-TARGET_SIC_CODES = sorted(HOLDINGS_SIC_CODES | SIC_62012_CODES | SIC_72110_CODES)
+TARGET_SIC_CODES = sorted(
+    {code for codes in SECTOR_SIC_CODES.values() for code in codes}
+)
+
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 LEADS_DIR = DATA_DIR / "leads"
@@ -63,12 +66,9 @@ def auth_header(api_key: str) -> Dict[str, str]:
 
 def classify_sector(sic_codes: List[str]) -> Optional[str]:
     codes = {str(code) for code in (sic_codes or [])}
-    if codes & HOLDINGS_SIC_CODES:
-        return "Holdings"
-    if codes & SIC_62012_CODES:
-        return "62012"
-    if codes & SIC_72110_CODES:
-        return "72110"
+    for sector, sector_codes in SECTOR_SIC_CODES.items():
+        if codes & sector_codes:
+            return sector
     return None
 
 
@@ -301,7 +301,7 @@ def render_quick_add(df: pd.DataFrame, person: str, run_date: str, existing_lead
 
 def main() -> None:
     st.title("Companies Incorporated Today")
-    st.caption("Filtered to Holdings, 62012, and 72110 only.")
+    st.caption("Filtered to Tech, Biotech, Restaurants, and Travel only.")
 
     api_keys = get_api_keys()
     if not api_keys:
